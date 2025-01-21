@@ -122,9 +122,9 @@ enum json_states {
 
 typedef struct {
     const char *restrict cur_pos;
-    unsigned char cur_depth;
     unsigned char *restrict stack;  // 1st element of the array indicates the current mode
     long long objval;
+    unsigned char cur_depth;
 } JSONParsingSession;
 static char *json_step( JSONParsingSession *restrict parser )
 {
