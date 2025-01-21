@@ -12,6 +12,7 @@
 #include "screen.h"
 #include "fonts.h"
 #include "monotonic.h"
+#include "sway-ipc.h"
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -32,7 +33,361 @@ extern PyTypeObject Screen_Type;
 #define EVDBG(...)
 #endif
 
+#ifndef NO_SWAYIPC
+#define EXTRA_FDS 3
+#else
 #define EXTRA_FDS 2
+#endif
+
+#ifndef NO_SWAYIPC
+
+static char *sway_get_socketpath(void) {
+    const char *swaysock = getenv("SWAYSOCK");
+    if (swaysock) {
+        return strdup(swaysock);
+    }
+    char *line = NULL;
+    size_t line_size = 0;
+    FILE *fp = popen("sway --get-socketpath 2>/dev/null", "r");
+    if (fp) {
+        ssize_t nret = getline(&line, &line_size, fp);
+        pclose(fp);
+        if (nret > 0) {
+            // remove trailing newline, if there is one
+            if (line[nret - 1] == '\n') {
+                line[nret - 1] = '\0';
+            }
+            return line;
+        }
+    }
+    const char *i3sock = getenv("I3SOCK");
+    if (i3sock) {
+        free(line);
+        return strdup(i3sock);
+    }
+    fp = popen("i3 --get-socketpath 2>/dev/null", "r");
+    if (fp) {
+        ssize_t nret = getline(&line, &line_size, fp);
+        pclose(fp);
+        if (nret > 0) {
+            // remove trailing newline, if there is one
+            if (line[nret - 1] == '\n') {
+                line[nret - 1] = '\0';
+            }
+            return line;
+        }
+    }
+    free(line);
+    return NULL;
+}
+
+static const char sway_magic[] = {'i', '3', '-', 'i', 'p', 'c'};
+static uint32_t payload_size = 0;
+static char *swayipc_buffer = 0;
+static unsigned int swayipc_buflen = 0;
+static uint32_t num_bytes_received = 0;
+static uint32_t payload_type;
+static pid_t own_pid;
+static id_t own_wid = 0;
+
+enum json_object_value {
+    JSON_VAL_STH_ELSE = 0,
+    JSON_VAL_NEW = 1,
+    JSON_VAL_FOCUS = 2,
+    JSON_VAL_MOVE = 3,
+    JSON_VAL_TITLE = 4,
+};
+static const char* json_object_values[] = { 0, "new", "focus", "move", "title" };
+
+enum json_object_names {
+    JSON_OBJ_STH_ELSE = 0,
+    JSON_OBJ_CHANGE = 1,
+    JSON_OBJ_SUCCESS = 2,
+    JSON_OBJ_CONTAINER = 3,
+    JSON_OBJ_RECT = 4,
+    JSON_OBJ_ID = 5,
+    JSON_OBJ_PID = 6,
+    JSON_OBJ_X = 7,
+    JSON_OBJ_Y = 8,
+};
+
+enum json_states {
+    JSON_STATE_CRAWL = 0,
+    JSON_STATE_OBJ_NAME = 1,
+    JSON_STATE_SKIP = 2,
+    JSON_STATE_OBJ_VALUE = 3,
+    JSON_STATE_HAS_OBTAINED_VALUE = 4,
+    JSON_STATE_SKIP_DEPTH = 5,
+};
+
+typedef struct {
+    const char *restrict cur_pos;
+    unsigned char cur_depth;
+    unsigned char *restrict stack;  // 1st element of the array indicates the current mode
+    long long objval;
+} JSONParsingSession;
+static char *json_step( JSONParsingSession *restrict parser )
+{
+    if ( *parser->cur_pos == 0 ) {
+        parser->cur_pos = 0;
+        return 0;
+    }
+
+    char *cur = (char *) parser->cur_pos;
+
+    switch ( parser->stack[0] ) {
+        case JSON_STATE_HAS_OBTAINED_VALUE:
+        case JSON_STATE_CRAWL:
+            switch ( *cur ) {
+                case '"':
+                    parser->stack[0] = JSON_STATE_OBJ_NAME;
+                    break;
+                case '{':
+                    parser->cur_depth += 1;
+                    break;
+                case '}':
+                    parser->cur_depth -= 1;
+                    break;
+            }
+            cur++;
+            break;
+
+        case JSON_STATE_OBJ_NAME:
+            switch ( *cur ) {
+#define skip_the_json_object() {\
+                        parser->stack[parser->cur_depth] = JSON_OBJ_STH_ELSE;\
+                        while ( *cur != '"' ) {\
+                            cur++;\
+                        }\
+                        parser->stack[0] = JSON_STATE_SKIP;\
+                    }
+#define process_the_following_letters(target_string, json_object_name) {\
+                        if ( strncmp( cur, target_string "\"", strlen(target_string "\"") ) == 0 ) {\
+                            parser->stack[parser->cur_depth] = json_object_name;\
+                            cur += strlen(target_string "\"");\
+                            parser->stack[0] = JSON_STATE_OBJ_VALUE;\
+                        } else {\
+                            skip_the_json_object()\
+                        }\
+                        while ( *cur != ':' ) {\
+                            cur++;\
+                        }\
+                    }
+                case 'c':
+                    cur++;
+                    switch ( *cur ) {
+                        case 'o':
+                            cur++;
+                            process_the_following_letters("ntainer", JSON_OBJ_CONTAINER)
+                            break;
+                        case 'h':
+                            cur++;
+                            process_the_following_letters("ange", JSON_OBJ_CHANGE)
+                            break;
+                    }
+                    break;
+                case 'i':
+                    cur++;
+                    process_the_following_letters("d", JSON_OBJ_ID)
+                    break;
+                case 'p':
+                    cur++;
+                    process_the_following_letters("id", JSON_OBJ_PID)
+                    break;
+                case 'r':
+                    cur++;
+                    process_the_following_letters("ect", JSON_OBJ_RECT)
+                    break;
+                case 's':
+                    cur++;
+                    //if ( *cur == 'u' && cur[1] == 'c' && cur[2] == 'c' && cur[3] == 'e' &&
+                    //        cur[4] == 's' && cur[5] == 's' && cur[6] == '"' ) {
+                    process_the_following_letters("uccess", JSON_OBJ_SUCCESS)
+                    break;
+                case 'x':
+                    cur++;
+                    process_the_following_letters("", JSON_OBJ_X)
+                    break;
+                case 'y':
+                    cur++;
+                    process_the_following_letters("", JSON_OBJ_Y)
+                    break;
+                default:
+                    skip_the_json_object()
+                    while ( *cur != ':' ) {
+                        cur++;
+                    }
+            }
+            break;
+
+        case JSON_STATE_SKIP:
+            // Skip to the next object without checking object value
+            do {
+                cur++;
+            } while ( *cur == ' ' );
+            switch ( *cur ) {
+                case '{':;
+                    // Skip through the entire object until cur_depth is back to the original value
+                    uint8_t orig_depth = parser->cur_depth;
+                    uint8_t local_state = JSON_STATE_CRAWL;
+                    cur++;
+                    parser->cur_depth += 1;
+                    while ( parser->cur_depth != orig_depth ) {
+                        switch ( local_state ) {
+                            case JSON_STATE_CRAWL:
+                                switch ( *cur ) {
+                                    case '"':
+                                        local_state = JSON_STATE_OBJ_NAME;
+                                        break;
+                                    case '{':
+                                        parser->cur_depth += 1;
+                                        break;
+                                    case '}':
+                                        parser->cur_depth -= 1;
+                                        break;
+                                    case 0:
+                                        parser->cur_pos = 0;
+                                        return 0;
+                                }
+                                cur++;
+                                break;
+                            case JSON_STATE_OBJ_NAME:
+                                while ( *cur != '"' ) {
+                                    cur++;
+                                }
+                                while ( *cur != ':' ) {
+                                    cur++;
+                                }
+                                do {
+                                    cur++;
+                                } while ( *cur == ' ' );
+                                switch ( *cur ) {
+                                    case '{':
+                                        cur++;
+                                        parser->cur_depth += 1;
+                                        local_state = JSON_STATE_CRAWL;
+                                        break;
+                                    case '"':
+                                        cur++;
+                                        while ( *cur != '"' ) {
+                                            if ( *cur == '\\' ) {
+                                                cur++;
+                                            }
+                                            cur++;
+                                        };
+                                        cur++;
+                                        local_state = JSON_STATE_CRAWL;
+                                        break;
+                                    case 0:
+                                        parser->cur_pos = 0;
+                                        return 0;
+                                    default:
+                                        while ( -1 ) {
+                                            cur++;
+                                            if ( *cur == ',' || *cur == '}' ) {
+                                                local_state = JSON_STATE_CRAWL;
+                                                break;
+                                            }
+                                            if ( *cur == 0 ) {
+                                                parser->cur_pos = 0;
+                                                return 0;
+                                            }
+                                        }
+                                        break;
+                                }
+                                break;
+                        }
+                    }
+                    parser->stack[0] = JSON_STATE_CRAWL;
+                    break;
+                case '"':
+                    cur++;
+                    while ( *cur != '"' ) {
+                        if ( *cur == '\\' ) {
+                            cur++;
+                        }
+                        cur++;
+                    }
+                    cur++;
+                    parser->stack[0] = JSON_STATE_CRAWL;
+                    break;
+                default:
+                    // Skip until you see ',' or '}'
+                    while ( -1 ) {
+                        cur++;
+                        if ( *cur == ',' || *cur == '}' ) {
+                            break;
+                        }
+                    }
+                    parser->stack[0] = JSON_STATE_CRAWL;
+                    break;
+            }
+
+            break;
+
+        case JSON_STATE_OBJ_VALUE:
+            do {
+                cur++;
+            } while ( *cur == ' ' );
+            switch ( *cur ) {
+                case '{':
+                    parser->cur_depth += 1;
+                    cur++;
+                    break;
+                case '"':
+                    cur++;
+                    unsigned int i = 1;
+                    for ( ; i < sizeof(json_object_values) / sizeof(void*); i++ ) {
+                        if ( strncmp(cur, json_object_values[i], strlen(json_object_values[i])) == 0 ) {
+                            cur += strlen(json_object_values[i]);
+                            cur++;
+                            parser->objval = i;
+                            break;
+                        }
+                    }
+                    if ( i >= sizeof(json_object_values) / sizeof(void*) ) {
+                        parser->objval = JSON_VAL_STH_ELSE;
+
+                        while ( *cur != '"' ) {
+                            if ( *cur == '\\' ) {
+                                cur++;
+                            }
+                            cur++;
+                        };
+                    }
+                    break;
+                case 't':
+                    cur += strlen("true");
+                    parser->objval = 1;
+                    break;
+                case 'f':
+                    cur += strlen("false");
+                    parser->objval = 0;
+                    break;
+                default:  // Digits
+                    parser->objval = atoll(cur);
+                    while ( -1 ) {
+                        cur++;
+                        if ( *cur < '0' || *cur > '9' ) {
+                            break;
+                        }
+                    }
+                    break;
+            }
+            parser->stack[0] = JSON_STATE_HAS_OBTAINED_VALUE;
+            break;
+
+        case JSON_STATE_SKIP_DEPTH:
+            // Do we need it?
+            break;
+    }
+
+    parser->cur_pos = cur;
+    return cur;
+}
+#endif  // #ifndef NO_SWAYIPC
+
+
 #ifndef MSG_NOSIGNAL
 // Apple does not implement MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -184,6 +539,119 @@ new_childmonitor_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwd
     self->count = 0;
     children_fds[0].fd = self->io_loop_data.wakeup_read_fd; children_fds[1].fd = self->io_loop_data.signal_read_fd;
     children_fds[0].events = POLLIN; children_fds[1].events = POLLIN; children_fds[2].events = POLLIN;
+#ifndef NO_SWAYIPC
+    children_fds[3].events = POLLIN;
+    own_pid = getpid();
+    const char *swaysock = getenv("SWAYSOCK");
+    if ( !swaysock ) {
+        children_fds[2].fd = -1;
+    } else {
+        struct sockaddr_un addr;
+        int sway_fd;
+        if ( (sway_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1 ) {
+            log_error("Unable to open Unix socket\n");
+        } else {
+            addr.sun_family = AF_UNIX;
+            char *socket_path = sway_get_socketpath();
+            strlcpy(addr.sun_path, socket_path, sizeof(addr.sun_path));
+            addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
+            if ( connect(sway_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1 ) {
+                log_error(" Unable to connect to %s\n", socket_path);
+                sway_fd = -1;
+            }
+            free(socket_path);
+        }
+
+        children_fds[2].fd = sway_fd;
+    }
+
+    if ( children_fds[2].fd != -1 ) {
+        const char first_payload[] = {'[', '"', 'w', 'i', 'n', 'd', 'o', 'w', '"', ']'};
+        uint32_t length = sizeof(first_payload);
+        uint32_t msg_type = IPC_SUBSCRIBE;
+        const size_t ipc_header_size = sizeof(sway_magic) + sizeof(uint32_t) + sizeof(uint32_t);
+        char header_buf[ipc_header_size];
+        memcpy(header_buf, sway_magic, sizeof(sway_magic));
+        memcpy(header_buf + sizeof(sway_magic), &length, sizeof(length));
+        memcpy(header_buf + sizeof(sway_magic) + sizeof(length), &msg_type, sizeof(msg_type));
+
+        if (write(children_fds[2].fd, header_buf, ipc_header_size) == -1) {
+            log_error("Unable to send IPC header\n");
+            goto failed_to_connect_to_sway;
+        }
+        if (write(children_fds[2].fd, first_payload, length) == -1) {
+            log_error("Unable to send IPC payload\n");
+            goto failed_to_connect_to_sway;
+        }
+
+        unsigned int num_bytes_received = 0;
+        while (num_bytes_received < ipc_header_size) {
+            ssize_t received = recv(children_fds[2].fd,
+                    header_buf + num_bytes_received, ipc_header_size - num_bytes_received, 0);
+            if (received <= 0) {
+                if (errno == EINTR) continue;
+                log_error("Unable to receive IPC response\n");
+                goto failed_to_connect_to_sway;
+            }
+            num_bytes_received += received;
+        }
+
+        uint32_t size;
+        memcpy(&size, header_buf + sizeof(sway_magic), sizeof(size));
+        //memcpy(&msg_type, header_buf + sizeof(sway_magic) + sizeof(size), sizeof(msg_type));
+
+        char payload[32];
+        num_bytes_received = 0;
+        while (num_bytes_received < size) {
+            ssize_t received = recv(children_fds[2].fd,
+                    payload + num_bytes_received, size - num_bytes_received, 0);
+            if (received < 0) {
+                if (errno == EINTR) continue;
+                log_error("Unable to receive IPC response\n");
+                goto failed_to_connect_to_sway;
+            }
+            num_bytes_received += received;
+        }
+        payload[size] = '\0';
+
+        // Check if the first reply is {"success": true}
+        unsigned char stack[8] = {0};
+        JSONParsingSession parser = {0};
+        parser.cur_pos = (void*)payload;
+        parser.stack = stack;
+        int has_succeeded = 0;
+        while ( parser.cur_pos ) {
+            json_step(&parser);
+            if ( stack[0] == JSON_STATE_HAS_OBTAINED_VALUE ) {
+                if ( parser.cur_depth == 1 && stack[parser.cur_depth] == JSON_OBJ_SUCCESS ) {
+                    has_succeeded = parser.objval;
+                }
+            }
+        }
+
+        if ( !has_succeeded ) {
+            log_error("The first reply should be {\"success\": true}"
+                    ", but it was:\n  %s\n", payload);
+            children_fds[2].fd = -1;
+        } else {
+#define INITIAL_BUFLEN (1024 + 256)  // It's just a random big number. A few hundred bytes bigger than a sample message from the sway on the author's linux system which was about 800 bytes long.
+            swayipc_buflen = INITIAL_BUFLEN;  // Align to 256-byte size
+            swayipc_buffer = malloc(swayipc_buflen);
+            if ( !swayipc_buffer ) {
+                fatal("Out of memory");
+            }
+        }
+    }
+
+#endif  // #ifndef NO_SWAYIPC
+    the_monitor = self;
+
+    return (PyObject*) self;
+
+failed_to_connect_to_sway:
+    safe_close(children_fds[2].fd, __FILE__, __LINE__);
+    children_fds[2].fd = -1;
+
     the_monitor = self;
 
     return (PyObject*) self;
@@ -1573,6 +2041,152 @@ io_loop(void *data) {
                 }
                 if (ss.child_died) reap_children(self, OPT(close_on_child_death));
             }
+#ifndef NO_SWAYIPC
+            if (children_fds[2].revents && POLLIN) {
+                if ( payload_size ) {
+                    goto receive_payload;
+                } else {
+                    const size_t ipc_header_size = sizeof(sway_magic) + sizeof(uint32_t) + sizeof(uint32_t);
+                    char header_buf[ipc_header_size];
+                    while (num_bytes_received < ipc_header_size) {
+                        ssize_t received = recv(children_fds[2].fd,
+                                header_buf + num_bytes_received, ipc_header_size - num_bytes_received, 0);
+                        if (received <= 0) {
+                            if (errno == EINTR) continue;
+                            break;
+                        }
+                        num_bytes_received += received;
+                    }
+
+                    if ( num_bytes_received < ipc_header_size ) {
+                        goto end_of_swayipc;
+                    }
+                    num_bytes_received = 0;
+
+                    memcpy(&payload_size, header_buf + sizeof(sway_magic), sizeof(payload_size));
+                    memcpy(&payload_type, header_buf + sizeof(sway_magic) + sizeof(payload_size), sizeof(payload_type));
+                    if ( payload_type != (uint32_t)IPC_EVENT_WINDOW ) {
+                        log_error("kitty hasn't subscribed to this type of sway/i3 event!"
+                                " (event type: 1<<31 | %u)\n", payload_type & 0x7fffffff);
+                    }
+
+                }
+receive_payload:
+                if ( payload_size > swayipc_buflen ) {
+                    free(swayipc_buffer);
+                    swayipc_buflen = (payload_size+256-1) & ~(256-1);  // Align to 256-byte size
+                    swayipc_buffer = malloc(swayipc_buflen);
+                    if ( !swayipc_buffer ) {
+                        fatal("Out of memory");
+                    }
+                }
+
+
+                ssize_t received = recv(children_fds[2].fd,
+                        swayipc_buffer + num_bytes_received, payload_size - num_bytes_received, 0);
+                if (received < 0) {
+                    if (errno == EINTR) continue;
+                    log_error("Unable to receive a message from sway. (got %u out of %u)\n",
+                            num_bytes_received, payload_size);
+                    break;
+                }
+                num_bytes_received += received;
+
+
+                if ( num_bytes_received == payload_size ) {
+                    num_bytes_received = 0;
+                    swayipc_buffer[payload_size] = '\0';
+                    payload_size = 0;
+                    if ( payload_type == (uint32_t)IPC_EVENT_WINDOW ) {
+                        unsigned char stack[8] = {0};
+                        JSONParsingSession parser = {0};
+                        parser.cur_pos = (void*) swayipc_buffer;
+                        parser.stack = stack;
+                        int8_t is_a_new_os_window = 0;
+                        id_t wid = 0;
+                        unsigned int x = 0, y = 0;
+
+                        while ( parser.cur_pos ) {
+                            json_step(&parser);
+                            if ( stack[0] == JSON_STATE_HAS_OBTAINED_VALUE ) {
+                                stack[0] = JSON_STATE_CRAWL;
+                                switch ( stack[parser.cur_depth] ) {
+                                    case JSON_OBJ_CHANGE:
+                                        if ( parser.cur_depth == 1 ) {
+                                            if ( parser.objval != JSON_VAL_NEW ) {
+                                                is_a_new_os_window = -1;
+                                            } else {
+                                                is_a_new_os_window = CHAR_MAX;
+                                            }
+                                        }
+                                        break;
+                                    case JSON_OBJ_ID:
+                                        if ( parser.cur_depth == 2 && stack[1] == JSON_OBJ_CONTAINER ) {
+                                            wid = parser.objval;
+                                        }
+                                        break;
+                                    case JSON_OBJ_PID:
+                                        if ( parser.cur_depth == 2 && stack[1] == JSON_OBJ_CONTAINER ) {
+                                            if ( parser.objval != getpid() ) {
+                                                // It's not about our window.
+                                                goto end_of_swayipc;
+                                            }
+                                        }
+                                        break;
+                                    case JSON_OBJ_X:
+                                        if ( parser.cur_depth == 3 && stack[1] == JSON_OBJ_CONTAINER
+                                                && stack[2] == JSON_OBJ_RECT ) {
+                                            x = parser.objval;
+                                        }
+                                        break;
+                                    case JSON_OBJ_Y:
+                                        if ( parser.cur_depth == 3 && stack[1] == JSON_OBJ_CONTAINER
+                                                && stack[2] == JSON_OBJ_RECT ) {
+                                            y = parser.objval;
+                                        }
+                                        break;
+                                }
+                            }
+                        }
+
+                        if ( !own_wid && is_a_new_os_window < 0 ) {
+                            own_wid = wid;
+                            goto save_wid;
+                        }
+                        if ( is_a_new_os_window > 0 ) {
+                            size_t i;
+save_wid:
+                            for ( i = 0; i < global_state.num_os_windows; i++ ) {
+                                OSWindow *w = global_state.os_windows + i;
+                                if ( w->sway_wid == 0 ) {
+                                    w->sway_wid = wid;
+                                    break;
+                                }
+                            }
+                            if ( i >= global_state.num_os_windows ) {
+                                // This wid goes to the OSWindow that will be created next.
+                                global_state.sway_wid_for_next_new_os_window = wid;
+                            }
+                        }
+
+                        for ( size_t i = 0; i < global_state.num_os_windows; i++ ) {
+                            OSWindow *w = global_state.os_windows + i;
+                            if ( w->sway_wid == wid ) {
+                                w->sway_wid = wid;
+                                w->before_fullscreen.x = x;
+                                w->before_fullscreen.y = y;
+                                break;
+                            }
+                        }
+
+                    } else {  // if ( payload_type == (uint32_t)IPC_EVENT_WINDOW )
+                        log_error("kitty hasn't subscribed to this type of sway/i3 event!"
+                                " (event type: 1<<31 | %u)\n", payload_type & 0x7fffffff);
+                    }
+                }
+            }
+end_of_swayipc:
+#endif  // #ifndef NO_SWAYIPC
             for (i = 0; i < self->count; i++) {
                 if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
                     data_received = true;

@@ -46,6 +46,46 @@ update_cursor_trail_target(CursorTrail *ct, Window *w) {
     }
 }
 
+static void
+update_cursor_trail_target_in_another_window(CursorTrail *ct, Window *tgt_w, Window *own_w, int bias_x, int bias_y) {
+    WindowRenderData *twd = &tgt_w->render_data;
+    WindowRenderData *owd = &own_w->render_data;
+    float left = FLT_MAX, right = FLT_MAX, top = FLT_MAX, bottom = FLT_MAX;
+    switch (owd->screen->cursor_render_info.shape) {
+        case CURSOR_BLOCK:
+        case CURSOR_HOLLOW:
+        case CURSOR_BEAM:
+        case CURSOR_UNDERLINE:
+            left = owd->xstart + twd->screen->cursor_render_info.x * owd->dx;
+            bottom = owd->ystart - (twd->screen->cursor_render_info.y + 1) * owd->dy;
+        default:
+            break;
+    }
+    switch (owd->screen->cursor_render_info.shape) {
+        case CURSOR_BLOCK:
+        case CURSOR_HOLLOW:
+            right = left + owd->dx;
+            top = bottom + owd->dy;
+            break;
+        case CURSOR_BEAM:
+            right = left + owd->dx / owd->screen->cell_size.width * OPT(cursor_beam_thickness);
+            top = bottom + owd->dy;
+            break;
+        case CURSOR_UNDERLINE:
+            right = left + owd->dx;
+            top = bottom + owd->dy / owd->screen->cell_size.height * OPT(cursor_underline_thickness);
+            break;
+        default:
+            break;
+    }
+    if (left != FLT_MAX) {
+        EDGE(x, 0) = left + bias_x * owd->dx / owd->screen->cell_size.width;
+        EDGE(x, 1) = right + bias_x * owd->dx / owd->screen->cell_size.width;
+        EDGE(y, 0) = top + bias_y * owd->dy / owd->screen->cell_size.height;
+        EDGE(y, 1) = bottom + bias_y * owd->dy / owd->screen->cell_size.height;
+    }
+}
+
 static bool
 should_skip_cursor_trail_update(CursorTrail *ct, Window *w, OSWindow *os_window) {
     if (os_window->live_resize.in_progress) {
@@ -156,8 +196,127 @@ update_cursor_trail_needs_render(CursorTrail *ct, Window *w) {
 
 bool
 update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_window) {
-    if (!WD.screen->paused_rendering.expires_at && OPT(cursor_trail) <= now - WD.screen->cursor->position_changed_by_client_at) {
-        update_cursor_trail_target(ct, w);
+    id_type max_fc_count = 0;
+    id_type prev_focused_os_window = 0, focused_os_window = 0;
+    // This code will pick arbitrary windows on Sway.
+    //for (size_t i = 0; i < global_state.num_os_windows; i++) {
+    //    OSWindow *w = &global_state.os_windows[i];
+    //    if (w->last_focused_counter > max_fc_count) {
+    //        prev_focused_os_window = focused_os_window;
+    //        focused_os_window = w->id; max_fc_count = w->last_focused_counter;
+    //    }
+    //}
+    for (size_t i = 0; i < global_state.num_os_windows; i++) {
+        OSWindow *w = &global_state.os_windows[i];
+        if (w->last_focused_counter > max_fc_count) {
+            focused_os_window = w->id; max_fc_count = w->last_focused_counter;
+        }
+    }
+    prev_focused_os_window = global_state.prev_focused_os_window;
+
+    //if ( OPT(cursor_trail_choreographed) && OPT(cursor_trail) <= now - global_state.last_focused_at &&
+    if ( OPT(cursor_trail_choreographed) &&
+            OPT(cursor_trail) <= now - WD.screen->cursor->position_changed_by_client_at &&
+            os_window->id == prev_focused_os_window ) {
+        if (!WD.screen->paused_rendering.expires_at) {
+            OSWindow *focused_osw = 0;
+            for (size_t o = 0; o < global_state.num_os_windows; o++) {
+                OSWindow *osw = global_state.os_windows + o;
+                if (osw->id == focused_os_window) {
+                    focused_osw = osw;
+                }
+            }
+            if ( focused_osw ) {
+                int focused_window_pos_x, focused_window_pos_y, prev_focused_window_pos_x, prev_focused_window_pos_y;
+                focused_window_pos_x = focused_osw->before_fullscreen.x;
+                focused_window_pos_y = focused_osw->before_fullscreen.y;
+                prev_focused_window_pos_x = os_window->before_fullscreen.x;
+                prev_focused_window_pos_y = os_window->before_fullscreen.y;
+
+                Tab *focused_tab = focused_osw->tabs + focused_osw->last_active_tab;
+                update_cursor_trail_target_in_another_window(ct,
+                        focused_tab->windows + focused_tab->active_window,
+                        w,
+                        focused_window_pos_x - prev_focused_window_pos_x,
+                        prev_focused_window_pos_y - focused_window_pos_y
+                        );
+            }
+        }
+    } else {
+        if ( !WD.screen->paused_rendering.expires_at &&
+                OPT(cursor_trail) <= now - WD.screen->cursor->position_changed_by_client_at ) {
+            if ( OPT(cursor_trail_choreographed) && os_window->is_focused &&
+                    os_window->id == focused_os_window &&
+                    global_state.origin_of_trail != prev_focused_os_window ) {
+                OSWindow *prev_focused_osw = 0;
+                for (size_t o = 0; o < global_state.num_os_windows; o++) {
+                    OSWindow *osw = global_state.os_windows + o;
+                    if (osw->id == prev_focused_os_window) {
+                        prev_focused_osw = osw;
+                    }
+                }
+                if ( prev_focused_osw ) {
+                    int focused_window_pos_x, focused_window_pos_y, prev_focused_window_pos_x, prev_focused_window_pos_y;
+                    focused_window_pos_x = os_window->before_fullscreen.x;
+                    focused_window_pos_y = os_window->before_fullscreen.y;
+                    prev_focused_window_pos_x = prev_focused_osw->before_fullscreen.x;
+                    prev_focused_window_pos_y = prev_focused_osw->before_fullscreen.y;
+
+                    // Prepare some pointers
+                    Tab *prev_focused_tab = &prev_focused_osw->tabs[prev_focused_osw->last_active_tab];
+                    Window *prev_focused_window = &prev_focused_tab->windows[prev_focused_tab->active_window];
+
+                    // Update the bottom and left edges
+                    for ( int i = 0;  i < 4;  i++ ) {
+                        ct->corner_x[i] = prev_focused_window->render_data.screen->cursor_render_info.x
+                            * w->render_data.dx;
+                        ct->corner_x[i] += w->render_data.xstart;
+                        ct->corner_y[i] = 0 - prev_focused_window->render_data.screen->cursor_render_info.y
+                            * w->render_data.dy;
+                        ct->corner_y[i] += w->render_data.ystart - w->render_data.dy;
+
+                        ct->corner_x[i] += (prev_focused_window_pos_x - focused_window_pos_x) *
+                            w->render_data.dx / w->render_data.screen->cell_size.width;
+                        ct->corner_y[i] -= (prev_focused_window_pos_y - focused_window_pos_y) *
+                            w->render_data.dy / w->render_data.screen->cell_size.height;
+                    }
+
+                    // Update the top and right edges
+                    switch (prev_focused_window->render_data.screen->cursor_render_info.shape) {
+                        case CURSOR_BLOCK:
+                        case CURSOR_HOLLOW:
+                            ct->corner_x[0] += w->render_data.dx;
+                            ct->corner_x[1] += w->render_data.dx;
+                            ct->corner_y[0] += w->render_data.dy;
+                            ct->corner_y[3] += w->render_data.dy;
+                            break;
+                        case CURSOR_BEAM:
+                            ct->corner_x[0] += w->render_data.dx / w->render_data.screen->cell_size.width
+                                * OPT(cursor_beam_thickness);
+                            ct->corner_x[1] += w->render_data.dx / w->render_data.screen->cell_size.width
+                                * OPT(cursor_beam_thickness);
+                            ct->corner_y[0] += w->render_data.dy;
+                            ct->corner_y[3] += w->render_data.dy;
+                            break;
+                        case CURSOR_UNDERLINE:
+                            ct->corner_x[0] += w->render_data.dx;
+                            ct->corner_x[1] += w->render_data.dx;
+                            ct->corner_y[0] += w->render_data.dy / w->render_data.screen->cell_size.height
+                                * OPT(cursor_underline_thickness);
+                            ct->corner_y[3] += w->render_data.dy / w->render_data.screen->cell_size.height
+                                * OPT(cursor_underline_thickness);
+                            break;
+                        default:
+                            break;
+                    }
+
+                    // Mark it so as for the future self to know that corner coordinates were
+                    // copied from the previosly focused OSWindow
+                    global_state.origin_of_trail = prev_focused_os_window;
+                }
+            }
+            update_cursor_trail_target(ct, w);
+        }
     }
 
     update_cursor_trail_corners(ct, w, now, os_window);

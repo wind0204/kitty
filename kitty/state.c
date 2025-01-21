@@ -218,6 +218,10 @@ add_os_window(void) {
     ans->tab_bar_render_data.vao_idx = create_cell_vao();
     ans->background_opacity = OPT(background_opacity);
     ans->created_at = monotonic();
+#ifndef NO_SWAYIPC
+    ans->sway_wid = global_state.sway_wid_for_next_new_os_window;
+    global_state.sway_wid_for_next_new_os_window = 0;
+#endif
 
     bool wants_bg = OPT(background_image) && OPT(background_image)[0] != 0;
     if (wants_bg) {

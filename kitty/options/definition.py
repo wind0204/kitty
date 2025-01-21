@@ -391,6 +391,22 @@ animation.
 '''
     )
 
+opt('cursor_trail_choreographed', 'no',
+    option_type='to_bool', ctype='bool',
+    long_text='''
+This is an experimental feature.
+Choreograph cursor trail animations being rendered on more than one OS window
+so as to show cursor trail drawn between the cursor positions of two OS windows
+when the focus has been moved to an OS window from another kitty's OS Window.
+The feature won't support kitty instances that have been launched without
+--single-instance|-1 option for the swift implementation of the experimental feature.
+The feature works on X11/xwayland and Sway(via Sway/i3 IPC), other wayland
+compositors are not supported at the moment. Since wayland windows don't know their
+position on the screen, We subscribe to the window events when launching on sway and
+interpret the JSON-formatted data from Sway and do several chores for the feature.
+'''
+    )
+
 egr()  # }}}
 
 # scrollback {{{

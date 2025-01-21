@@ -337,6 +337,7 @@ option_names = (
     'cursor_trail',
     'cursor_trail_decay',
     'cursor_trail_start_threshold',
+    'cursor_trail_choreographed',
     'cursor_underline_thickness',
     'default_pointer_shape',
     'detect_urls',
@@ -517,6 +518,7 @@ class Options:
     cursor_trail: int = 0
     cursor_trail_decay: typing.Tuple[float, float] = (0.1, 0.4)
     cursor_trail_start_threshold: int = 2
+    cursor_trail_choreographed: bool = False
     cursor_underline_thickness: float = 2.0
     default_pointer_shape: choices_for_default_pointer_shape = 'beam'
     detect_urls: bool = True

@@ -514,13 +514,26 @@ window_focus_callback(GLFWwindow *w, int focused) {
     if (!set_callback_window(w)) return;
     debug_input("\x1b[35mon_focus_change\x1b[m: window id: 0x%llu focused: %d\n", global_state.callback_os_window->id, focused);
     global_state.callback_os_window->is_focused = focused ? true : false;
+    monotonic_t now = monotonic();
     if (focused) {
         show_mouse_cursor(w);
         focus_in_event();
+        if ( now - global_state.last_focused_at > MONOTONIC_T_1e6 * 20 ) {
+            id_type max_fc_count = 0;
+            id_type prev_focused_os_window = 0;
+            for (size_t i = 0; i < global_state.num_os_windows; i++) {
+                OSWindow *w = &global_state.os_windows[i];
+                if (w->last_focused_counter > max_fc_count) {
+                    prev_focused_os_window = w->id; max_fc_count = w->last_focused_counter;
+                }
+            }
+            global_state.prev_focused_os_window = prev_focused_os_window;
+        }
+        global_state.last_focused_at = now;
         global_state.callback_os_window->last_focused_counter = ++focus_counter;
         global_state.check_for_active_animated_images = true;
+        global_state.origin_of_trail = global_state.callback_os_window->id;
     }
-    monotonic_t now = monotonic();
     global_state.callback_os_window->last_mouse_activity_at = now;
     global_state.callback_os_window->cursor_blink_zero_time = now;
     if (is_window_ready_for_callbacks()) {

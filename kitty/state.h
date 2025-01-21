@@ -50,6 +50,7 @@ typedef struct {
     float cursor_trail_decay_fast;
     float cursor_trail_decay_slow;
     float cursor_trail_start_threshold;
+    bool cursor_trail_choreographed;
     unsigned int url_style;
     unsigned int scrollback_pager_history_size;
     bool scrollback_fill_enlarged_window;
@@ -226,10 +227,10 @@ typedef struct {
     bool needs_render;
     monotonic_t updated_at;
     float opacity;
-    float corner_x[4];
-    float corner_y[4];
-    float cursor_edge_x[2];
-    float cursor_edge_y[2];
+    float corner_x[4];  // 3 0
+    float corner_y[4];  // 2 1
+    float cursor_edge_x[2];  // 0
+    float cursor_edge_y[2];  //   1
 } CursorTrail;
 
 typedef struct {
@@ -263,9 +264,13 @@ typedef struct WindowChromeState {
     float background_opacity;
 } WindowChromeState;
 
+
 typedef struct {
     void *handle;
     id_type id;
+#ifndef NO_SWAYIPC
+    id_type sway_wid;
+#endif
     monotonic_t created_at;
     struct {
         int x, y, w, h;
@@ -310,11 +315,16 @@ typedef struct {
     Options opts;
 
     id_type os_window_id_counter, tab_id_counter, window_id_counter;
+    id_type origin_of_trail, prev_focused_os_window;
+#ifndef NO_SWAYIPC
+    id_type sway_wid_for_next_new_os_window;
+#endif
     PyObject *boss;
     BackgroundImage *bgimage;
     OSWindow *os_windows;
     size_t num_os_windows, capacity;
     OSWindow *callback_os_window;
+    monotonic_t last_focused_at;
     bool is_wayland;
     bool has_render_frames;
     bool debug_rendering, debug_font_fallback;
