@@ -198,7 +198,7 @@ bool
 update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_window) {
     id_type max_fc_count = 0;
     id_type prev_focused_os_window = 0, focused_os_window = 0;
-    // This code will pick arbitrary windows on Sway.
+    // This code will pick arbitrary windows on Sway. Just utilize global_state.prev_focused_os_window
     //for (size_t i = 0; i < global_state.num_os_windows; i++) {
     //    OSWindow *w = &global_state.os_windows[i];
     //    if (w->last_focused_counter > max_fc_count) {
@@ -214,7 +214,6 @@ update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_wi
     }
     prev_focused_os_window = global_state.prev_focused_os_window;
 
-    //if ( OPT(cursor_trail_choreographed) && OPT(cursor_trail) <= now - global_state.last_focused_at &&
     if ( OPT(cursor_trail_choreographed) &&
             OPT(cursor_trail) <= now - WD.screen->cursor->position_changed_by_client_at &&
             os_window->id == prev_focused_os_window ) {
