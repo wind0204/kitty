@@ -100,17 +100,19 @@ should_skip_cursor_trail_update(CursorTrail *ct, Window *w, OSWindow *os_window)
         }
     }
 
-    id_type max_fc_count = 0;
-    id_type prev_focused_os_window = 0, focused_os_window = 0;
-    for (size_t i = 0; i < global_state.num_os_windows; i++) {
-        OSWindow *w = &global_state.os_windows[i];
-        if (w->last_focused_counter > max_fc_count) {
-            focused_os_window = w->id; max_fc_count = w->last_focused_counter;
+    if (OPT(cursor_trail_choreographed)) {
+        id_type max_fc_count = 0;
+        id_type prev_focused_os_window = 0, focused_os_window = 0;
+        for (size_t i = 0; i < global_state.num_os_windows; i++) {
+            OSWindow *w = &global_state.os_windows[i];
+            if (w->last_focused_counter > max_fc_count) {
+                focused_os_window = w->id; max_fc_count = w->last_focused_counter;
+            }
         }
-    }
-    prev_focused_os_window = global_state.prev_focused_os_window;
-    if ( w->id != prev_focused_os_window && w->id != focused_os_window ) {
-        return true;
+        prev_focused_os_window = global_state.prev_focused_os_window;
+        if ( w->id != prev_focused_os_window && w->id != focused_os_window ) {
+            return true;
+        }
     }
 
     return false;
